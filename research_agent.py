@@ -98,6 +98,64 @@ def _parse_years(year_input):
         return [y], str(y)
 
 
+def _improve_query(text):
+    """Convert a natural-language question into keyword search terms.
+    Strips question prefixes, filler words, and time references."""
+    import re
+    q = text.strip().rstrip("?")
+    # Remove leading question phrases: "Which genomics technologies..." -> "genomics technologies..."
+    q = re.sub(
+        r"^(which|what|how|why|where|when)\s+(are|is|do|does|did|have|has|can|could|would|should)\s+",
+        "", q, flags=re.IGNORECASE,
+    )
+    q = re.sub(r"^(which|what|how|why|where|when)\s+", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"^(can|could|would|should|does|do|did|are|is)\s+", "", q, flags=re.IGNORECASE)
+    # Remove time-range boilerplate: "over the last five years", "2020-2025", etc.
+    q = re.sub(
+        r"\b(over the past|over the last|in the last|during the|in the past)\s+\w+\b",
+        "", q, flags=re.IGNORECASE,
+    )
+    # Remove comparative/superlative framing
+    q = re.sub(
+        r"\b(the most|the least|the fastest|the highest|the lowest|the largest|the smallest|the best|the worst)\b",
+        "", q, flags=re.IGNORECASE,
+    )
+    # Remove meta-verbs and request words
+    q = re.sub(
+        r"\b(experienced|received|shown|demonstrated|exhibited|please|tell me|show me|list|find|give me|get|have been|has been|are being|were being)\b",
+        "", q, flags=re.IGNORECASE,
+    )
+    # Remove trailing year patterns (already handled by --year / _parse_years)
+    q = re.sub(r"\b\d{4}[\s-]+\d{4}\b", "", q)
+    q = re.sub(r"\b\d{4}\b", "", q)
+    # Remove common stopwords, keep 2+ char words (for acronyms like AI, RNA)
+    words = re.findall(r"\b[a-zA-Z]{2,}\b", q)
+    STOP = {
+        "the", "and", "for", "are", "has", "had", "but", "not", "you",
+        "all", "can", "its", "over", "last", "have", "that", "which",
+        "what", "how", "why", "where", "when", "with", "from", "been",
+        "were", "they", "their", "them", "this", "that", "these", "those",
+        "also", "than", "then", "each", "much", "more", "most", "some",
+        "any", "into", "about", "could", "would", "should", "does", "did",
+        "after", "before", "between", "through", "during", "without",
+        "years", "year", "five", "past", "role", "new",
+        "to", "in", "of", "at", "on", "by", "up", "no", "if", "or",
+        "as", "an", "be", "it", "is", "we", "he", "she", "do",
+    }
+    words = [w for w in words if w.lower() not in STOP]
+    if not words:
+        return text
+
+    # Check if the query maps to a predefined interest area (by keyword overlap)
+    known_areas = {k.lower(): v for k, v in PREDEFINED_QUERIES.items()}
+    combined = " ".join(words).lower()
+    for keyword, predefined_query in known_areas.items():
+        kw_parts = keyword.lower().split()
+        if any(p in combined for p in kw_parts):
+            return predefined_query
+    return " ".join(words)
+
+
 def _safe_get(url, params=None, headers=None, method="GET", json_payload=None):
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
@@ -126,7 +184,7 @@ def fetch_nih_projects(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
         "criteria": {
             "fiscal_years": ylist,
             "advanced_text_search": {
-                "operator": "and",
+                "operator": "or",
                 "search_field": "projecttitle,terms",
                 "search_text": interest,
             },
@@ -563,6 +621,7 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     known = {k.lower(): v for k, v in PREDEFINED_QUERIES.items()}
     if query is None:
         query = known.get(interest.lower(), interest)
+    query = _improve_query(query)
 
     ylist, ylabel = _parse_years(year)
 
@@ -577,6 +636,9 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     trials = fetch_clinical_trials(query, ylist, max_per_source)
     articles = fetch_pubmed(query, ylist, max_per_source)
 
+    all_empty = not projects and not trials and not articles
+    if all_empty:
+        print("  [WARN] No results from any source. Try using fewer/simpler keywords.")
     print("\n  Analyzing data ...")
     nih_analysis = analyze_nih(projects)
     ct_analysis = analyze_trials(trials)
@@ -656,7 +718,9 @@ def interactive_mode():
                 break
     else:
         interest_label = raw
-        search_query = raw
+        search_query = _improve_query(raw)
+        if search_query != raw:
+            print(f"  (converted to keywords: {search_query})")
 
     # --- Ask for year ---
     print()
