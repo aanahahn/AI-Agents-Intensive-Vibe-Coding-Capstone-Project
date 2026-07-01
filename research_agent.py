@@ -492,8 +492,12 @@ def write_report(out_dir, interest, year_label, query,
     lines.append("-" * 72)
     lines.append("  TABLEAU VISUALIZATION")
     lines.append("-" * 72)
-    lines.append("  CSV exported alongside this report. Open in Tableau Desktop/Public:")
-    lines.append("    1. Connect -> Text/CSV -> select tableau_data.csv")
+    lines.append("  Three CSVs exported alongside this report (one per source):")
+    lines.append(f"    NIH:  {safe_name}_{year_label}_nih.csv")
+    lines.append(f"    Trials: {safe_name}_{year_label}_trials.csv")
+    lines.append(f"    Pubs: {safe_name}_{year_label}_pubmed.csv")
+    lines.append("  Open in Tableau Desktop/Public:")
+    lines.append("    1. Connect -> Text/CSV -> select a CSV")
     lines.append("    2. Drag fields onto sheets to build charts")
     lines.append("  Suggested visualizations:")
     lines.append("    - NIH:    Bar chart: funding by organization or activity code")
@@ -508,32 +512,46 @@ def write_report(out_dir, interest, year_label, query,
     return report_path
 
 
-def write_tableau_csv(out_dir, interest, year_label,
-                      projects, trials, articles):
-    """Write a Tableau-friendly CSV aggregating all data sources."""
-    safe_name = interest.replace(" ", "_").replace("/", "_")[:60]
-    rows = []
+def _write_csv(path, fieldnames, rows):
+    """Write rows to a CSV file with headers."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"  CSV exported: {path}")
 
+
+def write_tableau_csv(out_dir, interest, year_label, query,
+                      projects, trials, articles):
+    """Write three per-source Tableau-friendly CSVs with query keyword."""
+    safe_name = interest.replace(" ", "_").replace("/", "_")[:60]
+    base_cols = ["Query", "Interest", "Year", "ID", "Title", "Link"]
+
+    # --- NIH ---
+    nih_rows = []
     for p in projects:
         org = p.get("organization") or {}
         pis = p.get("principalInvestigators") or []
-        pi_names = "; ".join(
-            pi.get("fullName", "") for pi in pis[:3]
-        )
+        pi_names = "; ".join(pi.get("fullName", "") for pi in pis[:3])
         appl_id = p.get("appl_id") or ""
-        rows.append({
-            "Source": "NIH RePORTER",
+        nih_rows.append({
+            "Query": query,
             "Interest": interest,
             "Year": year_label,
             "ID": str(appl_id),
             "Title": (p.get("project_title") or "")[:200],
+            "Link": f"https://reporter.nih.gov/project-details/{appl_id}",
             "Funding": p.get("award_amount") or 0,
             "Organization": org.get("org_name") or "",
             "PI": pi_names,
             "ActivityCode": p.get("activity_code") or "",
-            "Link": f"https://reporter.nih.gov/project-details/{appl_id}",
         })
+    nih_path = os.path.join(out_dir, f"{safe_name}_{year_label}_nih.csv")
+    _write_csv(nih_path, base_cols + ["Funding", "Organization", "PI", "ActivityCode"], nih_rows)
 
+    # --- Trials ---
+    trial_rows = []
     for t in trials:
         proto = t.get("protocolSection") or {}
         ident = proto.get("identificationModule") or {}
@@ -542,54 +560,48 @@ def write_tableau_csv(out_dir, interest, year_label,
         trial_year = (start_date.get("date", "")[:4]
                       if isinstance(start_date, dict) else str(start_date)[:4])
         nct_id = ident.get("nctId") or ""
-        rows.append({
-            "Source": "ClinicalTrials.gov",
+        ds = proto.get("designModule") or {}
+        cond_mod = proto.get("conditionsModule") or {}
+        trial_rows.append({
+            "Query": query,
             "Interest": interest,
             "Year": trial_year or year_label,
             "ID": nct_id,
             "Title": (ident.get("briefTitle")
                       or ident.get("officialTitle") or "")[:200],
-            "Funding": "",
-            "Organization": "",
-            "PI": "",
-            "ActivityCode": status.get("overallStatus") or "",
             "Link": f"https://clinicaltrials.gov/study/{nct_id}",
+            "Status": status.get("overallStatus") or "",
+            "Phase": "; ".join(ds.get("phases") or []),
+            "Conditions": "; ".join(cond_mod.get("conditions") or []),
         })
+    trial_path = os.path.join(out_dir, f"{safe_name}_{year_label}_trials.csv")
+    _write_csv(trial_path, base_cols + ["Status", "Phase", "Conditions"], trial_rows)
 
+    # --- PubMed ---
+    pub_rows = []
     for a in articles:
         pmid = a.get("uid") or ""
-        doi = ""
-        for aid in (a.get("articleids") or []):
-            if aid.get("idtype") == "doi":
-                doi = aid.get("value") or ""
-        rows.append({
-            "Source": "PubMed",
+        pub_rows.append({
+            "Query": query,
             "Interest": interest,
             "Year": (a.get("pubdate") or "")[:4] or year_label,
             "ID": pmid,
             "Title": (a.get("title") or "")[:200],
-            "Funding": "",
-            "Organization": a.get("source") or "",
-            "PI": "",
-            "ActivityCode": "",
             "Link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+            "Journal": a.get("source") or "",
+            "Authors": "; ".join(
+                au.get("name", "") for au in (a.get("authors") or [])[:5]
+            ),
+            "DOI": next(
+                (aid.get("value", "") for aid in (a.get("articleids") or [])
+                 if aid.get("idtype") == "doi"),
+                "",
+            ),
         })
+    pub_path = os.path.join(out_dir, f"{safe_name}_{year_label}_pubmed.csv")
+    _write_csv(pub_path, base_cols + ["Journal", "Authors", "DOI"], pub_rows)
 
-    csv_path = os.path.join(out_dir, f"{safe_name}_{year_label}_tableau_data.csv")
-    if rows:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-    else:
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=[
-                "Source", "Interest", "Year", "ID", "Title",
-                "Funding", "Organization", "PI", "ActivityCode", "Link",
-            ])
-            writer.writeheader()
-    print(f"  CSV exported: {csv_path}")
-    return csv_path
+    return {"nih": nih_path, "trials": trial_path, "pubmed": pub_path}
 
 
 # ---------------------------------------------------------------------------
@@ -649,8 +661,8 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     report_path = write_report(out_dir, interest, ylabel, query,
                                 nih_analysis, ct_analysis, pm_analysis,
                                 citations)
-    csv_path = write_tableau_csv(out_dir, interest, ylabel,
-                                  projects, trials, articles)
+    csv_files = write_tableau_csv(out_dir, interest, ylabel, query,
+                                   projects, trials, articles)
 
     print(f"\n{'='*60}")
     print(f"  SUMMARY")
@@ -659,12 +671,15 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     print(f"  Clinical trials   : {len(trials)}")
     print(f"  PubMed articles   : {len(articles)}")
     print(f"  Report            : {report_path}")
-    print(f"  Tableau CSV       : {csv_path}")
+    print(f"  CSVs              :")
+    print(f"    NIH:   {csv_files['nih']}")
+    print(f"    Trials:{csv_files['trials']}")
+    print(f"    Pubs:  {csv_files['pubmed']}")
     print(f"{'='*60}")
 
     return {
         "report_path": report_path,
-        "csv_path": csv_path,
+        "csv_files": csv_files,
         "nih_count": len(projects),
         "trials_count": len(trials),
         "pubmed_count": len(articles),
