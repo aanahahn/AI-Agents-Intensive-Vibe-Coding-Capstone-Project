@@ -156,6 +156,38 @@ def _improve_query(text):
     return " ".join(words)
 
 
+def _parse_query_terms(query):
+    """Split a Boolean OR query into individual keyword terms."""
+    return [t.strip() for t in query.split(" OR ") if t.strip()]
+
+
+def _matching_terms(terms, *text_fields):
+    """Return list of query terms found across any of the given text fields.
+    Matches on word boundaries for multi-word terms, uses substring for single words."""
+    if not terms:
+        return []
+    import re
+    combined = " ".join(t.lower() for t in text_fields if t)
+    matched = []
+    for t in terms:
+        pattern = r"\b" + re.escape(t.lower()) + r"\b"
+        if re.search(pattern, combined):
+            matched.append(t)
+    return matched
+
+
+def _keyword_stats(terms, records, text_getter):
+    """Count how many records match each query term.
+    text_getter is a function that returns the text to search per record."""
+    counts = {t: 0 for t in terms}
+    for rec in records:
+        text = text_getter(rec).lower() if text_getter(rec) else ""
+        for t in terms:
+            if t.lower() in text:
+                counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
 def _safe_get(url, params=None, headers=None, method="GET", json_payload=None):
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
@@ -410,8 +442,25 @@ def generate_citations(articles):
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
-def write_report(out_dir, interest, year_label, query,
-                 nih_analysis, ct_analysis, pm_analysis, citations):
+def _add_keyword_table(lines, terms, nih_stats, ct_stats, pm_stats):
+    """Append a formatted keyword-match table to lines."""
+    if not terms:
+        return
+    lines.append("  Query keyword breakdown (records matching each term):")
+    lines.append(f"  {'Term':30s} {'NIH':>6s} {'Trials':>8s} {'PubMed':>8s}")
+    lines.append(f"  {'-'*30} {'-'*6} {'-'*8} {'-'*8}")
+    for t in terms:
+        n = nih_stats.get(t, 0) if nih_stats else 0
+        c = ct_stats.get(t, 0) if ct_stats else 0
+        p = pm_stats.get(t, 0) if pm_stats else 0
+        lines.append(f"  {t:30s} {n:>6d} {c:>8d} {p:>8d}")
+    lines.append("")
+
+
+def write_report(out_dir, interest, year_label, query, terms,
+                 nih_analysis, ct_analysis, pm_analysis, citations,
+                 nih_keyword_stats=None, ct_keyword_stats=None,
+                 pm_keyword_stats=None):
     """Write the findings report to a .txt file."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     safe_name = interest.replace(" ", "_").replace("/", "_")[:60]
@@ -426,6 +475,9 @@ def write_report(out_dir, interest, year_label, query,
         "=" * 72,
         "",
     ]
+    if terms:
+        _add_keyword_table(lines, terms, nih_keyword_stats or {},
+                           ct_keyword_stats or {}, pm_keyword_stats or {})
 
     # Section 1: NIH
     lines.append("-" * 72)
@@ -522,21 +574,26 @@ def _write_csv(path, fieldnames, rows):
     print(f"  CSV exported: {path}")
 
 
-def write_tableau_csv(out_dir, interest, year_label, query,
+def write_tableau_csv(out_dir, interest, year_label, query, terms,
                       projects, trials, articles):
-    """Write three per-source Tableau-friendly CSVs with query keyword."""
+    """Write three per-source Tableau-friendly CSVs with query keyword + per-row keyword tags."""
     safe_name = interest.replace(" ", "_").replace("/", "_")[:60]
-    base_cols = ["Query", "Interest", "Year", "ID", "Title", "Link"]
+    base_cols = ["Query", "Keywords", "Interest", "Year", "ID", "Title", "Link"]
 
     # --- NIH ---
     nih_rows = []
     for p in projects:
+        kw = _matching_terms(terms,
+                             p.get("project_title"),
+                             p.get("abstract_text"),
+                             p.get("phr_text"))
         org = p.get("organization") or {}
         pis = p.get("principalInvestigators") or []
         pi_names = "; ".join(pi.get("fullName", "") for pi in pis[:3])
         appl_id = p.get("appl_id") or ""
         nih_rows.append({
             "Query": query,
+            "Keywords": "; ".join(kw) if kw else "(broad match)",
             "Interest": interest,
             "Year": year_label,
             "ID": str(appl_id),
@@ -562,17 +619,20 @@ def write_tableau_csv(out_dir, interest, year_label, query,
         nct_id = ident.get("nctId") or ""
         ds = proto.get("designModule") or {}
         cond_mod = proto.get("conditionsModule") or {}
+        title = (ident.get("briefTitle") or ident.get("officialTitle") or "")
+        conditions = "; ".join(cond_mod.get("conditions") or [])
+        kw = _matching_terms(terms, title, conditions)
         trial_rows.append({
             "Query": query,
+            "Keywords": "; ".join(kw) if kw else "(broad match)",
             "Interest": interest,
             "Year": trial_year or year_label,
             "ID": nct_id,
-            "Title": (ident.get("briefTitle")
-                      or ident.get("officialTitle") or "")[:200],
+            "Title": title[:200],
             "Link": f"https://clinicaltrials.gov/study/{nct_id}",
             "Status": status.get("overallStatus") or "",
             "Phase": "; ".join(ds.get("phases") or []),
-            "Conditions": "; ".join(cond_mod.get("conditions") or []),
+            "Conditions": conditions,
         })
     trial_path = os.path.join(out_dir, f"{safe_name}_{year_label}_trials.csv")
     _write_csv(trial_path, base_cols + ["Status", "Phase", "Conditions"], trial_rows)
@@ -580,13 +640,16 @@ def write_tableau_csv(out_dir, interest, year_label, query,
     # --- PubMed ---
     pub_rows = []
     for a in articles:
+        title = a.get("title") or ""
+        kw = _matching_terms(terms, title)
         pmid = a.get("uid") or ""
         pub_rows.append({
             "Query": query,
+            "Keywords": "; ".join(kw) if kw else "(broad match)",
             "Interest": interest,
             "Year": (a.get("pubdate") or "")[:4] or year_label,
             "ID": pmid,
-            "Title": (a.get("title") or "")[:200],
+            "Title": title[:200],
             "Link": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
             "Journal": a.get("source") or "",
             "Authors": "; ".join(
@@ -658,10 +721,36 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     citations = generate_citations(articles)
 
     os.makedirs(out_dir, exist_ok=True)
-    report_path = write_report(out_dir, interest, ylabel, query,
+
+    terms = _parse_query_terms(query)
+
+    def _nih_text(p):
+        return " ".join(filter(None, [
+            p.get("project_title"), p.get("abstract_text"), p.get("phr_text"),
+        ]))
+
+    def _trial_text(t):
+        proto = t.get("protocolSection") or {}
+        ident = proto.get("identificationModule") or {}
+        cond = proto.get("conditionsModule") or {}
+        return "{} {}".format(
+            ident.get("briefTitle") or ident.get("officialTitle") or "",
+            " ".join(cond.get("conditions") or []),
+        )
+
+    nih_kw = _keyword_stats(terms, projects, _nih_text)
+    ct_kw = _keyword_stats(terms, trials, _trial_text)
+    pm_kw = _keyword_stats(terms, articles, lambda a: a.get("title") or "")
+    pm_kw = _keyword_stats(terms, articles,
+                           lambda a: a.get("title") or "")
+
+    report_path = write_report(out_dir, interest, ylabel, query, terms,
                                 nih_analysis, ct_analysis, pm_analysis,
-                                citations)
-    csv_files = write_tableau_csv(out_dir, interest, ylabel, query,
+                                citations,
+                                nih_keyword_stats=nih_kw,
+                                ct_keyword_stats=ct_kw,
+                                pm_keyword_stats=pm_kw)
+    csv_files = write_tableau_csv(out_dir, interest, ylabel, query, terms,
                                    projects, trials, articles)
 
     print(f"\n{'='*60}")
