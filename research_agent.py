@@ -188,6 +188,23 @@ def _keyword_stats(terms, records, text_getter):
     return counts
 
 
+def _dump_json(data, path):
+    """Save data as formatted JSON."""
+    import json
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+
+
+def _load_json(path):
+    """Load data from a JSON file if it exists."""
+    import json
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
 def _safe_get(url, params=None, headers=None, method="GET", json_payload=None):
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
@@ -671,7 +688,8 @@ def write_tableau_csv(out_dir, interest, year_label, query, terms,
 # Main pipeline (public API for notebooks & CLI)
 # ---------------------------------------------------------------------------
 def run_pipeline(interest="genomics", year=2025, query=None,
-                 out_dir=".", max_per_source=MAX_RESULTS_PER_SOURCE):
+                 out_dir=".", max_per_source=MAX_RESULTS_PER_SOURCE,
+                 use_cache=True):
     """
     Execute the full research pipeline.
 
@@ -688,6 +706,9 @@ def run_pipeline(interest="genomics", year=2025, query=None,
         Output directory for report + CSV.
     max_per_source : int
         Max records to fetch per data source.
+    use_cache : bool
+        If True (default), saves raw API responses as JSON files and reuses
+        them on subsequent runs with the same interest/year/query.
 
     Returns
     -------
@@ -707,9 +728,25 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     print(f"  Query    : {query}")
     print(f"{'='*60}")
 
-    projects = fetch_nih_projects(query, ylist, max_per_source)
-    trials = fetch_clinical_trials(query, ylist, max_per_source)
-    articles = fetch_pubmed(query, ylist, max_per_source)
+    os.makedirs(out_dir, exist_ok=True)
+    safe_name = interest.replace(" ", "_").replace("/", "_")[:60]
+
+    # ---- Cached fetching ----
+    def _fetch_or_load(source, fetch_fn):
+        cache_path = os.path.join(out_dir, f".cache_{safe_name}_{ylabel}_{source}.json")
+        if use_cache:
+            cached = _load_json(cache_path)
+            if cached is not None:
+                print(f"  Using cached {source} data ({len(cached)} records)")
+                return cached
+        data = fetch_fn()
+        if use_cache and data is not None:
+            _dump_json(data, cache_path)
+        return data or []
+
+    projects = _fetch_or_load("nih", lambda: fetch_nih_projects(query, ylist, max_per_source))
+    trials = _fetch_or_load("trials", lambda: fetch_clinical_trials(query, ylist, max_per_source))
+    articles = _fetch_or_load("pubmed", lambda: fetch_pubmed(query, ylist, max_per_source))
 
     all_empty = not projects and not trials and not articles
     if all_empty:
@@ -903,6 +940,9 @@ if __name__ == "__main__":
         parser.add_argument("--max", "-m", type=int,
                             default=MAX_RESULTS_PER_SOURCE,
                             help="Max records per source")
+        parser.add_argument("--no-cache", "--nocache",
+                            action="store_false", dest="use_cache",
+                            help="Skip cached API responses and re-fetch")
 
         args = parser.parse_args()
 
@@ -923,4 +963,5 @@ if __name__ == "__main__":
             query=search_query,
             out_dir=args.outdir,
             max_per_source=args.max,
+            use_cache=args.use_cache,
         )
