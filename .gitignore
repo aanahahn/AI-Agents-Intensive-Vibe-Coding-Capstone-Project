@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 *.pyo
+.cache_*
+*_findings.txt
+*_report.txt
+*_nih.csv
+*_trials.csv
+*_pubmed.csv
+*_raw.csv
+*_summary.csv

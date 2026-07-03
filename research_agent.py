@@ -20,6 +20,7 @@ Quick start (CLI):
 
 import csv
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -63,6 +64,41 @@ PREDEFINED_QUERIES = {
 }
 
 
+EMERGING_TECHNOLOGIES = {
+    "genomics": {
+        "epigenetics": "epigenetics OR epigenomics OR DNA methylation OR histone modification OR chromatin remodeling",
+        "extracellular vesicles": "extracellular vesicles OR exosomes OR microvesicles OR ectosomes",
+        "spatial transcriptomics": "spatial transcriptomics OR spatial genomics OR MERFISH OR Visium",
+        "single-cell multi-omics": "single-cell multi-omics OR scRNA-seq OR CITE-seq OR single-cell ATAC-seq",
+        "liquid biopsy": "liquid biopsy OR circulating tumor DNA OR ctDNA OR circulating tumor cells OR liquid biopsy",
+        "CRISPR therapeutics": "CRISPR therapeutics OR CRISPR gene editing OR CRISPR therapy OR prime editing",
+        "long-read sequencing": "long-read sequencing OR nanopore sequencing OR PacBio OR SMRT sequencing",
+        "AI genomics": "machine learning genomics OR deep learning genomics OR AI genomics OR foundation model genomics",
+        "proteogenomics": "proteogenomics OR proteomics genomics OR proteogenomic",
+        "metagenomics": "metagenomics OR microbiome sequencing OR shotgun metagenomics",
+        "RNA therapeutics": "RNA therapeutics OR mRNA therapy OR siRNA therapy OR antisense oligonucleotide",
+        "gene therapy": "gene therapy OR gene replacement OR AAV therapy OR lentiviral gene therapy",
+        "organoids": "organoids OR organoid models OR patient-derived organoids",
+        "multi-omics integration": "multi-omics integration OR integrated multi-omics OR cross-omics",
+    },
+    "cell therapy": {
+        "CAR-T": "CAR-T OR chimeric antigen receptor T cell",
+        "TCR therapy": "TCR therapy OR T cell receptor engineering",
+        "NK cell therapy": "NK cell therapy OR natural killer cell therapy",
+        "stem cell therapy": "stem cell therapy OR mesenchymal stem cell OR iPSC therapy",
+        "tumor infiltrating lymphocytes": "tumor infiltrating lymphocytes OR TIL therapy",
+        "CAR-NK": "CAR-NK OR chimeric antigen receptor NK",
+        "gamma delta T cells": "gamma delta T cells OR gd T cells",
+    },
+    "personalized medicine": {
+        "pharmacogenomics": "pharmacogenomics OR pharmacogenetics OR drug-gene interaction",
+        "precision oncology": "precision oncology OR targeted therapy biomarker OR molecular tumor board",
+        "liquid biopsy": "liquid biopsy OR circulating tumor DNA OR minimal residual disease",
+        "digital pathology": "digital pathology OR AI pathology OR computational pathology",
+        "wearable biomarkers": "wearable biomarkers OR digital biomarkers OR continuous monitoring",
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -100,7 +136,8 @@ def _parse_years(year_input):
 
 def _improve_query(text):
     """Convert a natural-language question into keyword search terms.
-    Strips question prefixes, filler words, and time references."""
+    Strips question prefixes, meta-words, filler words, and time references,
+    then preserves remaining multi-word phrases."""
     import re
     q = text.strip().rstrip("?")
     # Remove leading question phrases: "Which genomics technologies..." -> "genomics technologies..."
@@ -128,8 +165,25 @@ def _improve_query(text):
     # Remove trailing year patterns (already handled by --year / _parse_years)
     q = re.sub(r"\b\d{4}[\s-]+\d{4}\b", "", q)
     q = re.sub(r"\b\d{4}\b", "", q)
+
+    # Remove meta-words: analysis-framing words that aren't subject matter
+    _META = (
+        r"\b(emerging|applications|future|trends|developments|advances|growth|"
+        r"technologies|techniques|approaches|methods|tools|strategies|"
+        r"landscape|overview|update|progress|current|recent|novel|state.of.the.art|"
+        r"breakthrough|innovation|innovative|promising|potential|latest|"
+        r"modern|contemporary|important|significant|major|key|critical|essential|"
+        r"fundamental|basic|applied|translational|improved|enhanced|accelerated|"
+        r"rapid|fast|cutting.edge|next.generation|novel|targeted|"
+        r"research|studies|study|investigate|investigation|explore|exploration|"
+        r"analysis|analyze|report|reporting|understanding|role|roles|"
+        r"function|functions|functional|promise|promising|develop|"
+        r"developed|developing|development|shown)\b"
+    )
+    q = re.sub(_META, "", q, flags=re.IGNORECASE)
+
     # Remove common stopwords, keep 2+ char words (for acronyms like AI, RNA)
-    words = re.findall(r"\b[a-zA-Z]{2,}\b", q)
+    words = re.findall(r"\b[a-zA-Z0-9][a-zA-Z0-9\-]{1,}\b", q)
     STOP = {
         "the", "and", "for", "are", "has", "had", "but", "not", "you",
         "all", "can", "its", "over", "last", "have", "that", "which",
@@ -141,17 +195,20 @@ def _improve_query(text):
         "years", "year", "five", "past", "role", "new",
         "to", "in", "of", "at", "on", "by", "up", "no", "if", "or",
         "as", "an", "be", "it", "is", "we", "he", "she", "do",
+        "being", "used", "using", "based", "related", "regarding",
+        "developed", "developing", "involve", "involves", "involving",
     }
     words = [w for w in words if w.lower() not in STOP]
     if not words:
         return text
 
-    # Check if the query maps to a predefined interest area (by keyword overlap)
+    # Check if the query maps to a predefined interest area (space-delimited match,
+    # so "cell" inside "single-cell" won't trigger "cell therapy")
     known_areas = {k.lower(): v for k, v in PREDEFINED_QUERIES.items()}
     combined = " ".join(words).lower()
     for keyword, predefined_query in known_areas.items():
         kw_parts = keyword.lower().split()
-        if any(p in combined for p in kw_parts):
+        if any(re.search(r"(^|\s)" + re.escape(p) + r"($|\s)", combined) for p in kw_parts):
             return predefined_query
     return " ".join(words)
 
@@ -224,8 +281,17 @@ def _safe_get(url, params=None, headers=None, method="GET", json_payload=None):
 # ---------------------------------------------------------------------------
 # 1. NIH RePORTER
 # ---------------------------------------------------------------------------
-def fetch_nih_projects(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
-    """Query NIH RePORTER v2 for projects matching interest + years (list)."""
+def fetch_nih_projects(interest, years, max_records=MAX_RESULTS_PER_SOURCE,
+                       include_active_projects=True):
+    """Query NIH RePORTER v2 for projects matching interest + years (list).
+
+    Parameters
+    ----------
+    include_active_projects : bool
+        If False, only returns completed projects with finalized budgets.
+        Use False for historical year-over-year comparison (fiscal_years filter
+        only distinguishes years correctly when this is False).
+    """
     ylist = _parse_years(years)[0]
     label = _parse_years(years)[1]
     print(f"  Fetching NIH projects for '{interest}' ({label}) ...")
@@ -237,7 +303,7 @@ def fetch_nih_projects(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
                 "search_field": "projecttitle,terms",
                 "search_text": interest,
             },
-            "include_active_projects": True,
+            "include_active_projects": include_active_projects,
             "exclude_subprojects": True,
         },
         "include_fields": [
@@ -299,7 +365,15 @@ def fetch_clinical_trials(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
 # 3. PubMed
 # ---------------------------------------------------------------------------
 def fetch_pubmed(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
-    """Search PubMed via E-utilities, then fetch summaries."""
+    """Search PubMed via E-utilities, then fetch summaries.
+
+    Returns
+    -------
+    list
+        Article dicts (fetched records).
+    int
+        Total matching publication count from esearch (may exceed max_records).
+    """
     ylist, ylabel = _parse_years(years)
     print(f"  Fetching PubMed articles for '{interest}' ({ylabel}) ...")
     if len(ylist) > 1:
@@ -315,11 +389,13 @@ def fetch_pubmed(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
     }
     search_data = _safe_get(PUBMED_ESEARCH, params=search_params)
     if not search_data:
-        return []
+        return [], 0
     _rate_limit()
-    id_list = (search_data.get("esearchresult") or {}).get("idlist") or []
+    esr = search_data.get("esearchresult") or {}
+    total_count = int(esr.get("count", 0))
+    id_list = esr.get("idlist") or []
     if not id_list:
-        return []
+        return [], total_count
     ids = id_list[:max_records]
 
     # Chunk IDs to avoid 414 URI Too Long errors on esummary
@@ -339,7 +415,7 @@ def fetch_pubmed(interest, years, max_records=MAX_RESULTS_PER_SOURCE):
             art = result_map.get(uid)
             if art and art.get("uid"):
                 articles.append(art)
-    return articles
+    return articles, total_count
 
 
 # ---------------------------------------------------------------------------
@@ -404,10 +480,19 @@ def analyze_trials(trials):
     }
 
 
-def analyze_pubmed(articles):
-    """Analyze PubMed publication data."""
+def analyze_pubmed(articles, total_count=None):
+    """Analyze PubMed publication data.
+
+    Parameters
+    ----------
+    articles : list
+        Article dicts from fetch_pubmed.
+    total_count : int or None
+        Total matching publication count from esearch. If provided, overrides
+        the "count" derived from articles alone.
+    """
     if not articles:
-        return {"count": 0}
+        return {"count": total_count or 0}
     journals = {}
     years = {}
     authors_count = []
@@ -420,7 +505,7 @@ def analyze_pubmed(articles):
         auths = a.get("authors") or []
         authors_count.append(len(auths))
     return {
-        "count": len(articles),
+        "count": total_count if total_count is not None else len(articles),
         "top_journals": sorted(journals.items(), key=lambda x: -x[1])[:5],
         "pub_years": sorted(years.items(), key=lambda x: -x[1], reverse=True)[:5],
         "avg_authors": round(sum(authors_count) / len(authors_count), 1)
@@ -685,6 +770,305 @@ def write_tableau_csv(out_dir, interest, year_label, query, terms,
 
 
 # ---------------------------------------------------------------------------
+# Emerging-areas analysis (multi-technology trend comparison)
+# ---------------------------------------------------------------------------
+def analyze_emerging_areas(interest="genomics", years="2020-2025",
+                           max_per_source=200, out_dir=".", use_cache=True):
+    """
+    Compare sub-technologies within a broad interest area across years.
+    Identifies technologies with rising NIH funding but low publication volume.
+
+    Parameters
+    ----------
+    interest : str
+        Key into EMERGING_TECHNOLOGIES dict (e.g. "genomics", "cell therapy").
+    years : str
+        Year range, e.g. "2020-2025".
+    max_per_source : int
+        Max records per API call.
+    out_dir : str
+        Output directory.
+    use_cache : bool
+        Cache raw API responses.
+
+    Returns
+    -------
+    dict with keys: report_path, findings_path, raw_csv, summary_csv, rankings
+    """
+    techs = EMERGING_TECHNOLOGIES.get(interest)
+    if not techs:
+        print(f"  No predefined sub-technologies for '{interest}'.")
+        print(f"  Available categories: {list(EMERGING_TECHNOLOGIES)}")
+        return
+
+    ylist, ylabel = _parse_years(years)
+    os.makedirs(out_dir, exist_ok=True)
+    safe_name = interest.replace(" ", "_").replace("/", "_")[:60]
+
+    print(f"\n{'='*60}")
+    print(f"  EMERGING AREAS ANALYSIS")
+    print(f"  Interest : {interest}")
+    print(f"  Years    : {ylabel}")
+    print(f"  Sub-technologies: {len(techs)}")
+    print(f"{'='*60}")
+
+    def _fetch_or_load(source_key, fetch_fn):
+        cache_path = os.path.join(out_dir, f".cache_{safe_name}_{ylabel}_{source_key}.json")
+        if use_cache:
+            cached = _load_json(cache_path)
+            if cached is not None:
+                return cached
+        data = fetch_fn()
+        if use_cache:
+            _dump_json(data, cache_path)
+        return data or []
+
+    rows = []
+    total_combos = len(techs) * len(ylist)
+    combo_idx = 0
+    for tech_name, tech_query in techs.items():
+        for yr in ylist:
+            combo_idx += 1
+            print(f"  [{combo_idx}/{total_combos}] {tech_name} ({yr})")
+
+            def _fetch_nih():
+                return fetch_nih_projects(
+                    tech_query, yr, max_records=max_per_source,
+                    include_active_projects=False,
+                )
+
+            def _fetch_pub():
+                return fetch_pubmed(tech_query, yr, max_records=max_per_source)
+
+            projects = _fetch_or_load(f"nih_{safe_name}_{tech_name}_{yr}", _fetch_nih)
+            pub_result = _fetch_or_load(f"pubmed_{safe_name}_{tech_name}_{yr}", _fetch_pub)
+            if isinstance(pub_result, (list, tuple)) and len(pub_result) == 2 \
+               and isinstance(pub_result[0], list) and isinstance(pub_result[1], (int, float)):
+                articles, total_pub_count = pub_result
+            else:
+                articles = (pub_result or []) if isinstance(pub_result, list) else []
+                total_pub_count = len(articles)
+            _rate_limit()
+
+            nih_a = analyze_nih(projects)
+            pm_a = analyze_pubmed(articles, total_count=total_pub_count)
+            rows.append({
+                "technology": tech_name,
+                "query": tech_query,
+                "year": yr,
+                "nih_count": nih_a.get("count", 0),
+                "nih_funding": nih_a.get("total_funding", 0),
+                "nih_avg_funding": nih_a.get("avg_funding", 0),
+                "pub_count": pm_a.get("count", 0),
+            })
+
+    if not rows:
+        print("  No data collected.")
+        return
+
+    import pandas as pd
+    df = pd.DataFrame(rows)
+
+    yr0_label = str(ylist[0])
+    yr1_label = str(ylist[-1])
+
+    summary_rows = []
+    for tech_name in techs:
+        t = df[df.technology == tech_name].sort_values("year").reset_index(drop=True)
+        if len(t) < 2:
+            continue
+        fvals = t.nih_funding.values.astype(float)
+        pvals = t.pub_count.values.astype(float)
+        avg_fund = float(fvals.mean())
+        avg_pub = float(pvals.mean())
+        f0, f1 = float(fvals[0]), float(fvals[-1])
+        p0, p1 = float(pvals[0]), float(pvals[-1])
+        yr0, yr1 = int(t.year.iloc[0]), int(t.year.iloc[-1])
+
+        fund_trend = "UP" if f1 > f0 else ("DOWN" if f1 < f0 else "FLAT")
+        pub_trend = "UP" if p1 > p0 else ("DOWN" if p1 < p0 else "FLAT")
+        fund_change_pct = ((f1 - f0) / f0 * 100) if f0 else 0
+        pub_change_pct = ((p1 - p0) / p0 * 100) if p0 else 0
+        pubs_per_m = avg_pub / (avg_fund / 1_000_000) if avg_fund > 0 else 0
+
+        row = {
+            "Technology": tech_name,
+            "Query": techs[tech_name],
+            "Avg_Funding": round(avg_fund, 0),
+            f"Funding_{yr0}": round(f0, 0),
+            f"Funding_{yr1}": round(f1, 0),
+            "Funding_Change_Pct": round(fund_change_pct, 1),
+            "Funding_Trend": fund_trend,
+            "Avg_Pubs": round(avg_pub, 0),
+            f"Pubs_{yr0}": round(p0, 0),
+            f"Pubs_{yr1}": round(p1, 0),
+            "Pub_Change_Pct": round(pub_change_pct, 1),
+            "Pub_Trend": pub_trend,
+            "Pubs_Per_1M_Funding": round(pubs_per_m, 2),
+            "_yr0": yr0,
+            "_yr1": yr1,
+        }
+        summary_rows.append(row)
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    candidates = summary_df[
+        (summary_df.Funding_Trend == "UP") & (summary_df.Avg_Funding > 0)
+    ].sort_values("Pubs_Per_1M_Funding")
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "=" * 95,
+        f"  EMERGING AREAS ANALYSIS \u2014 {interest.upper()}",
+        "=" * 95,
+        f"  Generated : {timestamp}",
+        f"  Years     : {ylabel}",
+        f"  Sub-technologies compared: {len(techs)}",
+        "=" * 95,
+        "",
+    ]
+
+    for _, r in candidates.iterrows():
+        yr0 = int(r["_yr0"])
+        yr1 = int(r["_yr1"])
+        lines.append("-" * 95)
+        lines.append(f"  {r['Technology']}")
+        lines.append(f"  Query: {r['Query']}")
+        lines.append(f"  Funding : ${r[f'Funding_{yr0}']:>12,.0f} ({yr0})  \u2192  ${r[f'Funding_{yr1}']:>12,.0f} ({yr1})  ({r['Funding_Trend']:>4s}, {r['Funding_Change_Pct']:+.1f}%)")
+        lines.append(f"  Pubs    : {r[f'Pubs_{yr0}']:>12.0f} ({yr0})  \u2192  {r[f'Pubs_{yr1}']:>12.0f} ({yr1})  ({r['Pub_Trend']:>4s}, {r['Pub_Change_Pct']:+.1f}%)")
+        lines.append(f"  Pubs per $1M funding : {r['Pubs_Per_1M_Funding']:.2f}")
+        lines.append("")
+
+    lines.append("=" * 95)
+    lines.append("  RANKING: Best candidates (increasing funding + low pubs/$1M)")
+    lines.append("=" * 95)
+    if len(candidates) > 0:
+        header = f"  {'Rank':>5s}  {'Technology':30s}  {'Fund Trend':>10s}  {'Fund Chg':>10s}  {'Pubs/$1M':>10s}  {'Avg Pubs':>10s}"
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for rank, (_, r) in enumerate(candidates.iterrows(), 1):
+            lines.append(
+                f"  {rank:>5d}  {r['Technology']:30s}  {r['Funding_Trend']:>10s}  {r['Funding_Change_Pct']:>+9.1f}%  {r['Pubs_Per_1M_Funding']:>9.2f}  {r['Avg_Pubs']:>9.0f}"
+            )
+    else:
+        lines.append("  No technologies with increasing funding found.")
+    lines.append("")
+
+    lines.append("=" * 95)
+    lines.append("  INTERPRETATION")
+    lines.append("=" * 95)
+    lines.append("""
+  Technologies ranked highest have NIH funding growing over the period while
+  producing relatively few publications per dollar invested. This may indicate:
+    (1) Capital-intensive field (equipment, consortia)
+    (2) Lag between grant award and publication
+    (3) Genuinely underexplored / emerging area
+  These are potential high-impact, less crowded research niches.
+""")
+
+    report_path = os.path.join(out_dir, f"emerging_{safe_name}_{ylabel}_report.txt")
+    raw_csv = os.path.join(out_dir, f"emerging_{safe_name}_{ylabel}_raw.csv")
+    sum_csv = os.path.join(out_dir, f"emerging_{safe_name}_{ylabel}_summary.csv")
+    findings_path = os.path.join(out_dir, f"emerging_{safe_name}_{ylabel}_findings.txt")
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"\n  Report written: {report_path}")
+
+    # Findings file
+    findings_lines = [
+        "=" * 99,
+        f"  FINDINGS: Emerging areas in {interest.upper()} with rising NIH funding",
+        "            and relatively low publication volume",
+        "=" * 99,
+        f"  Generated : {timestamp}",
+        f"  Period    : {ylabel}",
+        "  Sources   : NIH RePORTER (completed projects), PubMed (total publication counts)",
+        f"  Analysis  : Compared {len(techs)} sub-technologies across {len(ylist)} years;",
+        "              ranked by funding trend (must be UP) then ascending pubs/$1M.",
+        "=" * 99,
+        "",
+    ]
+
+    if len(candidates) > 0:
+        findings_lines.append("TOP CANDIDATES")
+        findings_lines.append("-" * 99)
+        findings_lines.append("")
+        for rank, (_, r) in enumerate(candidates.iterrows(), 1):
+            yr0 = int(r["_yr0"])
+            yr1 = int(r["_yr1"])
+            findings_lines.append(f"  {rank}. {r['Technology']}")
+            findings_lines.append(f"     Funding: ${r[f'Funding_{yr0}']:>10,.0f} ({yr0}) \u2192 ${r[f'Funding_{yr1}']:>10,.0f} ({yr1})  {r['Funding_Trend']:>4s} {r['Funding_Change_Pct']:+.1f}%")
+            findings_lines.append(f"     Pubs:   {r[f'Pubs_{yr0}']:>10,.0f} ({yr0}) \u2192 {r[f'Pubs_{yr1}']:>10,.0f} ({yr1})  {r['Pub_Trend']:>4s} {r['Pub_Change_Pct']:+.1f}%")
+            findings_lines.append(f"     Pubs per $1M funding: {r['Pubs_Per_1M_Funding']:.0f}")
+            findings_lines.append("")
+    else:
+        findings_lines.append("  No technologies with increasing funding found.")
+
+    down = summary_df[summary_df.Funding_Trend != "UP"]
+    if len(down) > 0:
+        findings_lines.append("=" * 99)
+        findings_lines.append("  TECHNOLOGIES THAT DID NOT QUALIFY (funding flat or declining)")
+        findings_lines.append("=" * 99)
+        findings_lines.append("")
+        for _, r in down.iterrows():
+            findings_lines.append(
+                f"  {r['Technology']:40s}  {r['Funding_Trend']:>4s}  {r['Funding_Change_Pct']:+.1f}%"
+            )
+        findings_lines.append("")
+
+    findings_lines.append("=" * 99)
+    findings_lines.append("  INTERPRETATION")
+    findings_lines.append("=" * 99)
+    findings_lines.append(
+        f"""
+  Technologies ranked highest have NIH funding growing over the period while
+  producing relatively few publications per dollar invested. This may indicate:
+    (1) Capital-intensive field (equipment, consortia)
+    (2) Lag between grant award and publication
+    (3) Genuinely underexplored / emerging area
+  These are potential high-impact, less crowded research niches.
+
+  Detailed per-technology breakdown and Tableau-ready CSVs:
+    - {os.path.basename(report_path)}
+    - {os.path.basename(raw_csv)}
+    - {os.path.basename(sum_csv)}
+"""
+    )
+
+    with open(findings_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(findings_lines))
+    print(f"  Findings written: {findings_path}")
+
+    df.to_csv(raw_csv, index=False)
+    print(f"  CSV exported: {raw_csv}")
+
+    summary_csv_out = summary_df.drop(columns=["_yr0", "_yr1"], errors="ignore")
+    summary_csv_out.to_csv(sum_csv, index=False)
+    print(f"  CSV exported: {sum_csv}")
+
+    print(f"\n{'='*60}")
+    print(f"  EMERGING AREAS ANALYSIS COMPLETE")
+    print(f"{'='*60}")
+    print(f"  Technologies analyzed : {len(techs)}")
+    print(f"  Years                : {ylabel}")
+    print(f"  Candidates found     : {len(candidates)}")
+    print(f"  Report               : {report_path}")
+    print(f"  Findings             : {findings_path}")
+    print(f"  Raw data CSV         : {raw_csv}")
+    print(f"  Summary CSV          : {sum_csv}")
+    print(f"{'='*60}")
+
+    return {
+        "report_path": report_path,
+        "findings_path": findings_path,
+        "raw_csv": raw_csv,
+        "summary_csv": sum_csv,
+        "rankings": candidates.to_dict("records") if len(candidates) > 0 else [],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline (public API for notebooks & CLI)
 # ---------------------------------------------------------------------------
 def run_pipeline(interest="genomics", year=2025, query=None,
@@ -746,7 +1130,14 @@ def run_pipeline(interest="genomics", year=2025, query=None,
 
     projects = _fetch_or_load("nih", lambda: fetch_nih_projects(query, ylist, max_per_source))
     trials = _fetch_or_load("trials", lambda: fetch_clinical_trials(query, ylist, max_per_source))
-    articles = _fetch_or_load("pubmed", lambda: fetch_pubmed(query, ylist, max_per_source))
+    pubmed_result = _fetch_or_load("pubmed", lambda: fetch_pubmed(query, ylist, max_per_source))
+    # Cache format: either list-of-articles (old) or [articles, total_count] (new)
+    if isinstance(pubmed_result, (list, tuple)) and len(pubmed_result) == 2 \
+       and isinstance(pubmed_result[0], list) and isinstance(pubmed_result[1], (int, float)):
+        articles, total_pub_count = pubmed_result
+    else:
+        articles = (pubmed_result or []) if isinstance(pubmed_result, list) else []
+        total_pub_count = len(articles)
 
     all_empty = not projects and not trials and not articles
     if all_empty:
@@ -754,7 +1145,7 @@ def run_pipeline(interest="genomics", year=2025, query=None,
     print("\n  Analyzing data ...")
     nih_analysis = analyze_nih(projects)
     ct_analysis = analyze_trials(trials)
-    pm_analysis = analyze_pubmed(articles)
+    pm_analysis = analyze_pubmed(articles, total_count=total_pub_count)
     citations = generate_citations(articles)
 
     os.makedirs(out_dir, exist_ok=True)
@@ -828,6 +1219,10 @@ def interactive_mode():
     print("    2. ClinicalTrials.gov — clinical studies worldwide")
     print("    3. PubMed — 35M+ biomedical publications")
     print()
+    print("  Ask broad questions like 'Which genomics technologies are getting")
+    print("  increasing NIH funding with low publication volume?' to get a")
+    print("  cross-technology trend analysis.")
+    print()
 
     # --- Ask for research interest ---
     print("  Pre-defined interest areas:")
@@ -863,6 +1258,14 @@ def interactive_mode():
         if search_query != raw:
             print(f"  (converted to keywords: {search_query})")
 
+    # Check if this looks like an "emerging areas" / landscaping question
+    _analyze_keywords = [
+        "technologies", "techniques", "approaches", "methods",
+        "receiving increasing", "growing funding", "emerging area",
+        "which.*are", "low publication", "underpublished",
+    ]
+    _is_analyze = any(re.search(k, raw, re.IGNORECASE) for k in _analyze_keywords)
+
     # --- Ask for year ---
     print()
     yr_raw = input(f"  Year(s) (e.g. 2025 or 2022-2025) [{datetime.now().year}]: ").strip()
@@ -878,6 +1281,47 @@ def interactive_mode():
         max_per = min(int(max_raw), 500) if max_raw else MAX_RESULTS_PER_SOURCE
     except ValueError:
         max_per = MAX_RESULTS_PER_SOURCE
+
+    # Route landscaping questions to emerging-areas analysis
+    if _is_analyze:
+        interest_label = raw.lower()
+        for cat in EMERGING_TECHNOLOGIES:
+            if cat.lower() in interest_label:
+                interest_label = cat
+                break
+        else:
+            print()
+            print(f"  Detected an emerging-areas analysis question.")
+            print(f"  Available categories: {', '.join(EMERGING_TECHNOLOGIES)}")
+            print("  Or type any keyword to run the standard pipeline instead.")
+            interest_label = input("  Which category? ").strip().lower()
+            matched = False
+            for cat in EMERGING_TECHNOLOGIES:
+                if cat.lower() == interest_label:
+                    interest_label = cat
+                    matched = True
+                    break
+            if not matched:
+                print(f"  Running standard pipeline with '{interest_label}'.")
+                run_pipeline(
+                    interest=interest_label,
+                    year=year,
+                    query=interest_label,
+                    out_dir=".",
+                    max_per_source=max_per,
+                )
+                return
+
+        print(f"  Routing to emerging-areas analysis for '{interest_label}'.")
+        year_analyze = yr_raw if yr_raw else "2020-2025"
+        analyze_emerging_areas(
+            interest=interest_label,
+            years=year_analyze,
+            max_per_source=max_per,
+            out_dir=".",
+            use_cache=True,
+        )
+        return
 
     print()
     run_pipeline(
@@ -922,6 +1366,7 @@ if __name__ == "__main__":
                 "  python research_agent.py --interest genomics --year 2025\n"
                 '  python research_agent.py --interest "cell therapy" --year 2024\n'
                 '  python research_agent.py --interest custom --query "mRNA vaccine"\n'
+                '  python research_agent.py --analyze --interest genomics --year 2020-2025\n'
             ),
         )
         parser.add_argument(
@@ -943,8 +1388,26 @@ if __name__ == "__main__":
         parser.add_argument("--no-cache", "--nocache",
                             action="store_false", dest="use_cache",
                             help="Skip cached API responses and re-fetch")
+        parser.add_argument("--analyze", "-a", action="store_true",
+                            help="Run emerging-areas analysis (compare sub-technologies across years)")
 
         args = parser.parse_args()
+
+        # Emerging-areas analysis mode
+        if args.analyze:
+            interest_label = args.interest
+            if interest_label == "custom":
+                print("ERROR: --analyze requires a pre-defined interest, not 'custom'",
+                      file=sys.stderr)
+                sys.exit(1)
+            analyze_emerging_areas(
+                interest=interest_label,
+                years=args.year,
+                max_per_source=args.max,
+                out_dir=args.outdir,
+                use_cache=args.use_cache,
+            )
+            sys.exit(0)
 
         if args.interest == "custom":
             if not args.query:
